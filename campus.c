@@ -1,328 +1,279 @@
-/* CampusCompute - OS Level 3 Mini-Project. Build: make. Run: ./campus help */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <limits.h>
 #include <unistd.h>
 #include <signal.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include <fcntl.h>
 #include <sys/mman.h>
-#include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/resource.h>
 
-#define MAXJ 32
-#define QUANTUM 2
-
-/* ---------- FR1: jobs ---------- */
-typedef struct { int id, arrival, burst, priority, rem, start, ct, tat, wt; const char *status; } Job;
-
-static Job sample[] = {
-    {1,0,5,2},{2,1,3,1},{3,2,8,4},{4,3,2,3},{5,4,4,1}};
-static int sample_n = 5;
-
-static int load_jobs(const char *file, Job *out) {
-    if (!file) { memcpy(out, sample, sizeof(sample)); for (int i=0;i<sample_n;i++){out[i].rem=out[i].burst;out[i].status="NEW";} return sample_n; }
-    FILE *f = fopen(file, "r");
-    if (!f) { fprintf(stderr, "Error: cannot open '%s': %s\n", file, strerror(errno)); return -1; }
-    int n = 0;
-    while (n < MAXJ) {
-        Job j = {0};
-        int r = fscanf(f, "%d %d %d %d", &j.id, &j.arrival, &j.burst, &j.priority);
-        if (r == EOF) break;
-        if (r != 4 || j.id <= 0 || j.arrival < 0 || j.burst <= 0 || j.priority < 0) {
-            fprintf(stderr, "Error: malformed job line (need: id arrival burst priority, positive burst)\n"); fclose(f); return -1; }
-        j.rem = j.burst; j.status = "NEW"; out[n++] = j;
-    }
-    fclose(f);
-    if (n == 0) { fprintf(stderr, "Error: no jobs in file\n"); return -1; }
-    return n;
+#define NJ 32
+#define Q 2
+typedef struct { int id,a,b,p,rem,ct; } Job;
+static const Job defaults[]={
+ {.id=1,.a=0,.b=5,.p=2}, {.id=2,.a=1,.b=3,.p=1},
+ {.id=3,.a=2,.b=8,.p=4}, {.id=4,.a=3,.b=2,.p=3},
+ {.id=5,.a=4,.b=4,.p=1}};
+static int reap(pid_t p,int *st){
+ int r; do {r=waitpid(p,st,0);} while(r<0 && errno==EINTR);
+ if(r<0) perror("waitpid");
+ return r<0?1:0;
+}
+static int order(const void *a,const void *b){
+ const Job *x=a,*y=b;
+ if(x->a!=y->a) return (x->a>y->a)-(x->a<y->a);
+ return (x->id>y->id)-(x->id<y->id);
+}
+static int load(const char *path,Job *j){
+ int n=0;
+ if(!path){memcpy(j,defaults,sizeof defaults);n=5;}
+ else {
+  FILE *f=fopen(path,"r");if(!f){perror(path);return -1;}
+  char line[256];
+  while(fgets(line,sizeof line,f)){
+   char extra; Job v={0};
+   if(n==NJ || sscanf(line,"%d %d %d %d %c",&v.id,&v.a,&v.b,&v.p,&extra)!=4 ||
+      v.id<=0 || v.a<0 || v.a>1000000 || v.b<=0 || v.b>1000000 || v.p<0){
+    fprintf(stderr,"Invalid input: maximum 32 jobs; id>0, arrival 0..1000000, burst 1..1000000, priority>=0.\n");fclose(f);return -1;
+   }
+   for(int k=0;k<n;k++) if(j[k].id==v.id){fprintf(stderr,"Duplicate job ID\n");fclose(f);return -1;}
+   j[n++]=v;
+  }
+  int bad=ferror(f);fclose(f);if(bad || !n){fprintf(stderr,"Empty/unreadable job file\n");return -1;}
+ }
+ for(int i=0;i<n;i++){j[i].rem=j[i].b;j[i].ct=0;}
+ qsort(j,n,sizeof *j,order);return n;
+}
+/* Scheduler simulation; no hard-coded results. RR arrivals at a quantum
+   boundary enter the queue before the just-preempted job. */
+static void schedule(Job *j,int n,int mode,double *aw,double *at){
+ const char *names[]={"FCFS","Round Robin","Priority"};
+ printf("\n== %s ==\nTie: arrival, then lower ID. Priority: lower number is higher. RR quantum=%d\nTimeline: ",names[mode],Q);
+ int t=0,done=0,next=0,queue[NJ+1],head=0,tail=0,count=0;
+ while(done<n){
+  int k=-1;
+  if(mode==1){
+   while(next<n && j[next].a<=t){queue[tail]=next++;tail=(tail+1)%(NJ+1);count++;}
+   if(!count){printf("[%d-%d] IDLE  ",t,j[next].a);t=j[next].a;continue;}
+   k=queue[head];head=(head+1)%(NJ+1);count--;
+  }else{
+   for(int i=0;i<n;i++) if(j[i].rem && j[i].a<=t){
+    if(k<0 || (mode==2 && j[i].p<j[k].p)) k=i;
+   }
+   if(k<0){for(int i=0;i<n;i++) if(j[i].rem){printf("[%d-%d] IDLE  ",t,j[i].a);t=j[i].a;break;}continue;}
+  }
+  int run=(mode==1 && j[k].rem>Q)?Q:j[k].rem;
+  printf("[%d-%d] J%d  ",t,t+run,j[k].id);t+=run;j[k].rem-=run;
+  if(mode==1){
+   while(next<n && j[next].a<=t){queue[tail]=next++;tail=(tail+1)%(NJ+1);count++;}
+   if(j[k].rem){queue[tail]=k;tail=(tail+1)%(NJ+1);count++;}
+  }
+  if(!j[k].rem){j[k].ct=t;done++;}
+ }
+ double sw=0,st=0;
+ puts("\nID Arrival Burst Priority Completion Turnaround Waiting Status");
+ for(int i=0;i<n;i++){
+  int tat=j[i].ct-j[i].a,wt=tat-j[i].b;sw+=wt;st+=tat;
+  printf("J%d %7d %5d %8d %10d %10d %7d DONE\n",j[i].id,j[i].a,j[i].b,j[i].p,j[i].ct,tat,wt);
+ }
+ *aw=sw/n;*at=st/n;printf("Average waiting=%.2f turnaround=%.2f\n",*aw,*at);
+}
+static int sched(const char *alg,const char *path){
+ int m=!strcmp(alg,"fcfs")?0:!strcmp(alg,"rr")?1:!strcmp(alg,"prio")?2:!strcmp(alg,"all")?3:-1;
+ if(m<0){fprintf(stderr,"Use fcfs|rr|prio|all\n");return 1;}
+ Job base[NJ],copy[NJ];int n=load(path,base);if(n<0)return 1;
+ double w[3]={0},t[3]={0};
+ for(int i=0;i<3;i++) if(m==3 || m==i){memcpy(copy,base,(size_t)n*sizeof *base);schedule(copy,n,i,&w[i],&t[i]);}
+ if(m==3){puts("\nComparison: SAME job set\nPolicy       AvgWaiting AvgTurnaround");const char *names[]={"FCFS","RR","Priority"};for(int i=0;i<3;i++)printf("%-12s %10.2f %13.2f\n",names[i],w[i],t[i]);}
+ return 0;
 }
 
-/* ---------- FR2: scheduling ---------- */
-/* Tie-break everywhere: earlier arrival first, then lower job ID. Priority: lower number = higher priority. */
-static int cmp_arr(const void *a, const void *b) {
-    const Job *x=a,*y=b;
-    if (x->arrival!=y->arrival) return x->arrival-y->arrival;
-    return x->id-y->id;
+#define CAP 4
+typedef struct {
+ char data[CAP][80];int head,tail,count,closed,write_error;
+ pthread_mutex_t mutex;pthread_cond_t full,empty;FILE *file;
+} Logger;
+typedef struct {Logger *l;int id;} Producer;
+static void *produce(void *arg){
+ Producer *p=arg;Logger *l=p->l;
+ for(int i=1;i<=5;i++){
+  pthread_mutex_lock(&l->mutex);
+  while(l->count==CAP)pthread_cond_wait(&l->full,&l->mutex);
+  snprintf(l->data[l->tail],80,"Producer-%d: job event #%d",p->id,i);
+  printf("[produce] %s queue=%d\n",l->data[l->tail],l->count+1);
+  l->tail=(l->tail+1)%CAP;l->count++;
+  pthread_cond_signal(&l->empty);pthread_mutex_unlock(&l->mutex);
+ }
+ return NULL;
 }
-static void seg(int *t, int id, int s, int e) { (void)t; printf("[%d-%d] J%d  ", s, e, id); }
-
-static void report(const char *name, Job *j, int n, double *avgwt, double *avgtat) {
-    double sw=0, st=0;
-    printf("\n%-4s %-8s %-6s %-5s %-11s %-11s %-8s\n","ID","Arrival","Burst","Prio","Completion","Turnaround","Waiting");
-    for (int i=0;i<n;i++){
-        j[i].tat=j[i].ct-j[i].arrival; j[i].wt=j[i].tat-j[i].burst; j[i].status="DONE";
-        printf("J%-3d %-8d %-6d %-5d %-11d %-11d %-8d\n",j[i].id,j[i].arrival,j[i].burst,j[i].priority,j[i].ct,j[i].tat,j[i].wt);
-        sw+=j[i].wt; st+=j[i].tat; }
-    *avgwt=sw/n; *avgtat=st/n;
-    printf("%s averages: turnaround=%.2f waiting=%.2f\n", name, *avgtat, *avgwt);
+static void *consume(void *arg){
+ Logger *l=arg;int n=0;
+ for(;;){
+  pthread_mutex_lock(&l->mutex);
+  while(!l->count && !l->closed)pthread_cond_wait(&l->empty,&l->mutex);
+  if(!l->count && l->closed){pthread_mutex_unlock(&l->mutex);break;}
+  char line[80];strcpy(line,l->data[l->head]);l->head=(l->head+1)%CAP;l->count--;
+  pthread_cond_signal(&l->full);pthread_mutex_unlock(&l->mutex);
+  if(fprintf(l->file,"LOG %02d | %s\n",++n,line)<0)l->write_error=1;
+  printf("[consume] log entry %d: %s\n",n,line);
+ }
+ return NULL;
 }
-
-static void run_fcfs(Job *j, int n, double *w, double *t_) {
-    qsort(j,n,sizeof(Job),cmp_arr);
-    printf("\n== FCFS (tie-break: arrival, then lower ID) ==\nTimeline: ");
-    int t=0;
-    for (int i=0;i<n;i++){
-        if (t<j[i].arrival) t=j[i].arrival;
-        seg(&t,j[i].id,t,t+j[i].burst); t+=j[i].burst; j[i].ct=t; }
-    printf("\n"); report("FCFS",j,n,w,t_);
-}
-
-static void run_rr(Job *j, int n, double *w, double *t_) {
-    qsort(j,n,sizeof(Job),cmp_arr);
-    printf("\n== Round Robin (quantum=%d, tie-break: arrival, then lower ID) ==\nTimeline: ", QUANTUM);
-    int q[1024], head=0, tail=0, next=0, t=0, done=0;
-    while (done<n) {
-        while (next<n && j[next].arrival<=t) q[tail++%1024]=next++;
-        if (head==tail) { t=j[next].arrival; continue; }
-        int k=q[head++%1024];
-        int run = j[k].rem<QUANTUM ? j[k].rem : QUANTUM;
-        seg(&t,j[k].id,t,t+run); t+=run; j[k].rem-=run;
-        while (next<n && j[next].arrival<=t) q[tail++%1024]=next++;
-        if (j[k].rem>0) q[tail++%1024]=k; else { j[k].ct=t; done++; }
-    }
-    printf("\n"); report("RR",j,n,w,t_);
-}
-
-static void run_prio(Job *j, int n, double *w, double *t_) {
-    qsort(j,n,sizeof(Job),cmp_arr);
-    printf("\n== Priority non-preemptive (lower number = higher priority; tie: arrival, then lower ID) ==\nTimeline: ");
-    int t=0, done=0, fin[MAXJ]={0};
-    while (done<n) {
-        int best=-1;
-        for (int i=0;i<n;i++) {
-            if (fin[i]||j[i].arrival>t) continue;
-            if (best<0 || j[i].priority<j[best].priority) best=i; /* array is sorted by arrival,id so ties keep earlier */
-        }
-        if (best<0) { for (int i=0;i<n;i++) if(!fin[i]){t=j[i].arrival;break;} continue; }
-        seg(&t,j[best].id,t,t+j[best].burst); t+=j[best].burst; j[best].ct=t; fin[best]=1; done++;
-    }
-    printf("\n"); report("Priority",j,n,w,t_);
+static int logger(void){
+ Logger l={.mutex=PTHREAD_MUTEX_INITIALIZER,.full=PTHREAD_COND_INITIALIZER,.empty=PTHREAD_COND_INITIALIZER};
+ l.file=fopen("campus.log","w");if(!l.file){perror("campus.log");return 1;}
+ pthread_t c,p[2];Producer args[2];int made=0,rc=0;
+ int e=pthread_create(&c,NULL,consume,&l);
+ if(e){fprintf(stderr,"pthread_create: %s\n",strerror(e));fclose(l.file);return 1;}
+ for(int i=0;i<2;i++){
+  args[i]=(Producer){&l,i+1};e=pthread_create(&p[i],NULL,produce,&args[i]);
+  if(e){fprintf(stderr,"pthread_create: %s\n",strerror(e));rc=1;break;}made++;
+ }
+ for(int i=0;i<made;i++)pthread_join(p[i],NULL);
+ pthread_mutex_lock(&l.mutex);l.closed=1;pthread_cond_broadcast(&l.empty);pthread_mutex_unlock(&l.mutex);
+ pthread_join(c,NULL);if(fclose(l.file))rc=1;if(l.write_error)rc=1;
+ pthread_cond_destroy(&l.full);pthread_cond_destroy(&l.empty);pthread_mutex_destroy(&l.mutex);
+ printf("All %d producer(s) and consumer joined cleanly; synchronization objects destroyed. Log: campus.log\n",made);
+ return rc;
 }
 
-static int cmd_sched(const char *algo, const char *file) {
-    Job j[MAXJ]; double w,t;
-    int n=load_jobs(file,j); if(n<0) return 1;
-    if (!strcmp(algo,"fcfs")) run_fcfs(j,n,&w,&t);
-    else if (!strcmp(algo,"rr")) run_rr(j,n,&w,&t);
-    else if (!strcmp(algo,"prio")) run_prio(j,n,&w,&t);
-    else if (!strcmp(algo,"all")) {
-        double r[3][2]; const char *nm[3]={"FCFS","RR","Priority"};
-        Job c[MAXJ];
-        memcpy(c,j,sizeof(j)); run_fcfs(c,n,&r[0][0],&r[0][1]);
-        memcpy(c,j,sizeof(j)); run_rr(c,n,&r[1][0],&r[1][1]);
-        memcpy(c,j,sizeof(j)); run_prio(c,n,&r[2][0],&r[2][1]);
-        printf("\n== Comparison (same job set) ==\n%-10s %-12s %-12s\n","Policy","AvgWaiting","AvgTurnaround");
-        for(int i=0;i<3;i++) printf("%-10s %-12.2f %-12.2f\n",nm[i],r[i][0],r[i][1]);
-    } else { fprintf(stderr,"Error: unknown algorithm '%s' (use fcfs|rr|prio|all)\n",algo); return 1; }
-    return 0;
+typedef struct {int n,data[5];char msg[64];} Shared;
+static int ipc(void){
+ char sn[64],mn[64];snprintf(sn,sizeof sn,"/campus_shm_%ld",(long)getpid());snprintf(mn,sizeof mn,"/campus_sem_%ld",(long)getpid());
+ int fd=-1,rc=1,created=0;Shared *s=MAP_FAILED;sem_t *sem=SEM_FAILED;
+ fd=shm_open(sn,O_CREAT|O_EXCL|O_RDWR,0600);if(fd<0){perror("shm_open");return 1;}created=1;
+ if(ftruncate(fd,sizeof *s)){perror("ftruncate");goto cleanup;}
+ s=mmap(NULL,sizeof *s,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);if(s==MAP_FAILED){perror("mmap");goto cleanup;}
+ sem=sem_open(mn,O_CREAT|O_EXCL,0600,0);if(sem==SEM_FAILED){perror("sem_open");goto cleanup;}
+ printf("Created shared memory %s and semaphore %s\n",sn,mn);
+ pid_t p=fork();if(p<0){perror("fork");goto cleanup;}
+ if(!p){
+  int r;do{r=sem_wait(sem);}while(r<0 && errno==EINTR);
+  if(r<0){perror("sem_wait");_exit(2);}
+  int sum=0;for(int i=0;i<s->n;i++)sum+=s->data[i];
+  printf("[reader pid=%ld] message='%s', values=%d, sum=%d\n",(long)getpid(),s->msg,s->n,sum);
+  munmap(s,sizeof *s);close(fd);sem_close(sem);_exit(0);
+ }
+ s->n=5;for(int i=0;i<5;i++)s->data[i]=(i+1)*10;strcpy(s->msg,"CPU usage report from writer");
+ printf("[writer pid=%ld] data ready; sem_post releases reader\n",(long)getpid());
+ if(sem_post(sem)){perror("sem_post");kill(p,SIGKILL);}
+ int st;if(!reap(p,&st) && WIFEXITED(st) && WEXITSTATUS(st)==0)rc=0;
+cleanup:
+ if(s!=MAP_FAILED && munmap(s,sizeof *s)){perror("munmap");rc=1;}
+ if(fd>=0 && close(fd)){perror("close");rc=1;}
+ if(sem!=SEM_FAILED){if(sem_close(sem)){perror("sem_close");rc=1;}if(sem_unlink(mn)){perror("sem_unlink");rc=1;}}
+ if(created && shm_unlink(sn)){perror("shm_unlink");rc=1;}
+ fd=shm_open(sn,O_RDONLY,0);if(fd>=0){close(fd);rc=1;}else if(errno!=ENOENT)rc=1;
+ if(sem!=SEM_FAILED){sem_t *check=sem_open(mn,0);if(check!=SEM_FAILED){sem_close(check);rc=1;}else if(errno!=ENOENT)rc=1;}
+ printf("IPC cleanup verification: %s\n",rc?"ERROR (see above)":"shared memory and semaphore absent; child reaped");return rc;
 }
-
-/* ---------- FR3: producer-consumer logger ---------- */
-#define BUFSZ 4
-#define NPROD 2
-#define PER_PROD 5
-static char buf[BUFSZ][80];
-static int in_i=0,out_i=0,cnt=0;
-static pthread_mutex_t mx=PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t not_full=PTHREAD_COND_INITIALIZER, not_empty=PTHREAD_COND_INITIALIZER;
-static const char *LOGFILE="campus.log";
-
-static void *producer(void *arg) {
-    long id=(long)arg;
-    for (int i=1;i<=PER_PROD;i++) {
-        pthread_mutex_lock(&mx);
-        while (cnt==BUFSZ) pthread_cond_wait(&not_full,&mx);
-        snprintf(buf[in_i],80,"Producer-%ld: job event #%d",id,i);
-        printf("[produce] %s (queue=%d)\n",buf[in_i],cnt+1);
-        in_i=(in_i+1)%BUFSZ; cnt++;
-        pthread_cond_signal(&not_empty);
-        pthread_mutex_unlock(&mx);
-        usleep(20000*id);
-    }
-    return NULL;
+static int banker(const char *which){
+ int a[5][3]={{0,1,0},{2,0,0},{3,0,2},{2,1,1},{0,0,2}};
+ int max[5][3]={{7,5,3},{3,2,2},{9,0,2},{2,2,2},{4,3,3}};
+ int avail[3]={3,3,2},need[5][3],work[3],fin[5]={0},seq[5],n=0;
+ if(!strcmp(which,"unsafe")){avail[0]=0;avail[1]=0;avail[2]=1;}
+ else if(strcmp(which,"safe")){fprintf(stderr,"Use banker safe|unsafe\n");return 1;}
+ printf("\nBanker's %s case\nAvailable: %d %d %d\nP   Allocation Maximum   Need\n",which,avail[0],avail[1],avail[2]);
+ for(int i=0;i<5;i++){
+  printf("P%d  ",i);
+  for(int r=0;r<3;r++){printf("%d ",a[i][r]);}
+  printf("   ");
+  for(int r=0;r<3;r++){printf("%d ",max[i][r]);}
+  printf("   ");
+  for(int r=0;r<3;r++){need[i][r]=max[i][r]-a[i][r];printf("%d ",need[i][r]);}
+  puts("");
+ }
+ memcpy(work,avail,sizeof work);
+ for(;;){int progress=0;
+  for(int i=0;i<5;i++)if(!fin[i]){
+   int ok=1;for(int r=0;r<3;r++)if(need[i][r]>work[r])ok=0;
+   if(ok){for(int r=0;r<3;r++)work[r]+=a[i][r];fin[i]=1;seq[n++]=i;progress=1;}
+  }
+  if(!progress)break;
+ }
+ if(n==5){printf("SAFE. Safe sequence: ");for(int i=0;i<5;i++)printf("P%d%s",seq[i],i==4?"\n":" -> ");}
+ else {printf("UNSAFE. Cannot finish:");for(int i=0;i<5;i++)if(!fin[i])printf(" P%d",i);puts("\nUnsafe means no guaranteed safe sequence; not necessarily an existing deadlock.");}
+ return 0;
 }
-static void *consumer(void *arg) {
-    FILE *f=arg;
-    for (int k=0;k<NPROD*PER_PROD;k++) {
-        pthread_mutex_lock(&mx);
-        while (cnt==0) pthread_cond_wait(&not_empty,&mx);
-        char line[80]; strcpy(line,buf[out_i]); out_i=(out_i+1)%BUFSZ; cnt--;
-        pthread_cond_signal(&not_full);
-        pthread_mutex_unlock(&mx);
-        fprintf(f,"LOG %02d | %s\n",k+1,line); fflush(f);
-        printf("[consume] wrote log entry %02d\n",k+1);
-        usleep(30000);
-    }
-    return NULL;
+static int worker(const char *mode){
+ int fail=!strcmp(mode,"fail");if(!fail && strcmp(mode,"normal")){fprintf(stderr,"Use worker normal|fail\n");return 1;}
+ pid_t p[3];int made=0,rc=0,bad=0;
+ for(int i=0;i<3;i++){
+  pid_t x=fork();if(x<0){perror("fork");rc=1;break;}
+  if(!x){printf("[worker %d pid=%ld] started\n",i+1,(long)getpid());
+   if(fail && i==1){puts("SIMULATED failure: exit status 3");_exit(3);}
+   if(fail && i==2){puts("SIMULATED failure: self SIGKILL");raise(SIGKILL);_exit(4);}
+   _exit(0);
+  }
+  p[made++]=x;
+ }
+ for(int i=0;i<made;i++){
+  int st;if(reap(p[i],&st)){rc=1;continue;}
+  int expected=0;
+  if(WIFEXITED(st)){int e=WEXITSTATUS(st);printf("[parent] pid=%ld exit=%d\n",(long)p[i],e);if(e)bad++;expected=e==((fail && i==1)?3:0) && !(fail && i==2);}
+  else if(WIFSIGNALED(st)){int sig=WTERMSIG(st);bad++;printf("[parent] pid=%ld signal=%d (%s)\n",(long)p[i],sig,strsignal(sig));expected=fail && i==2 && sig==SIGKILL;}
+  if(!expected)rc=1;
+ }
+ printf("Workers: %d of %d failed%s; all created children waited for.\n",bad,made,fail?" (SIMULATED)":"");return rc;
 }
-static int cmd_logger(void) {
-    in_i=out_i=cnt=0;
-    FILE *f=fopen(LOGFILE,"w"); if(!f){perror("fopen campus.log");return 1;}
-    pthread_t p[NPROD],c;
-    if (pthread_create(&c,NULL,consumer,f)) { perror("pthread_create"); fclose(f); return 1; }
-    for (long i=0;i<NPROD;i++) if (pthread_create(&p[i],NULL,producer,(void*)(i+1))) { perror("pthread_create"); return 1; }
-    for (int i=0;i<NPROD;i++) pthread_join(p[i],NULL);
-    pthread_join(c,NULL);
-    fclose(f);
-    printf("All threads joined cleanly. %d entries written to %s\n",NPROD*PER_PROD,LOGFILE);
-    return 0;
+/* RLIMIT_AS is demonstrated only in a child, leaving the main program unchanged. */
+static int limits(void){
+ pid_t p=fork();if(p<0){perror("fork");return 1;}
+ if(!p){struct rlimit r={64UL<<20,64UL<<20};
+  if(setrlimit(RLIMIT_AS,&r)){perror("setrlimit RLIMIT_AS");_exit(2);}
+  puts("[child] RLIMIT_AS=64 MiB; requesting 256 MiB");
+  void *m=malloc(256UL<<20);
+  if(!m){printf("malloc returned NULL: %s (limit observed)\n",strerror(errno));_exit(0);}
+  printf("Unexpected allocation success at %p\n",m);free(m);_exit(1);
+ }
+ int st,rc=0;if(reap(p,&st))return 1;
+ if(!WIFEXITED(st) || WEXITSTATUS(st)!=0)rc=1;
+ p=fork();if(p<0){perror("fork");return 1;}
+ if(!p){struct rlimit r={1,3};if(setrlimit(RLIMIT_CPU,&r)){perror("setrlimit RLIMIT_CPU");_exit(2);}
+  signal(SIGXCPU,SIG_DFL);struct rlimit core={0,0};(void)setrlimit(RLIMIT_CORE,&core);
+  puts("[child] RLIMIT_CPU soft=1 second, hard=3 seconds; spinning");for(;;){}
+ }
+ if(reap(p,&st))return 1;
+ if(WIFSIGNALED(st)){int sig=WTERMSIG(st);printf("[parent] CPU child signal=%d (%s)\n",sig,strsignal(sig));if(sig!=SIGXCPU && sig!=SIGKILL)rc=1;}
+ else {puts("CPU limit not observed");rc=1;}
+ printf("Resource limits: %s\n",rc?"FAIL":"OK; both children reaped");return rc;
 }
-
-/* ---------- FR4: shared memory + named semaphore ---------- */
-typedef struct { int n; int data[8]; char msg[64]; } Shared;
-static int shm_exists(const char *name){ int fd=shm_open(name,O_RDONLY,0); if(fd>=0){close(fd);return 1;} return 0; }
-
-static int cmd_ipc(void) {
-    char shname[64], semname[64];
-    snprintf(shname,64,"/campus_shm_%d",getpid()); snprintf(semname,64,"/campus_sem_%d",getpid());
-    int fd=shm_open(shname,O_CREAT|O_RDWR|O_EXCL,0600);
-    if(fd<0){perror("shm_open");return 1;}
-    if(ftruncate(fd,sizeof(Shared))<0){perror("ftruncate");shm_unlink(shname);return 1;}
-    Shared *s=mmap(NULL,sizeof(Shared),PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
-    if(s==MAP_FAILED){perror("mmap");shm_unlink(shname);return 1;}
-    sem_t *sem=sem_open(semname,O_CREAT|O_EXCL,0600,0);
-    if(sem==SEM_FAILED){perror("sem_open");munmap(s,sizeof(Shared));shm_unlink(shname);return 1;}
-    printf("Created %s and %s\n",shname,semname);
-    pid_t pid=fork();
-    if(pid<0){perror("fork");return 1;}
-    if(pid==0){ /* reader / consumer process */
-        sem_wait(sem);
-        int sum=0; for(int i=0;i<s->n;i++) sum+=s->data[i];
-        printf("[reader pid=%d] got message '%s', %d values, sum=%d\n",getpid(),s->msg,s->n,sum);
-        munmap(s,sizeof(Shared)); sem_close(sem); _exit(0);
-    }
-    printf("[writer pid=%d] writing data to shared memory\n",getpid());
-    s->n=5; for(int i=0;i<5;i++) s->data[i]=(i+1)*10;
-    strcpy(s->msg,"CPU usage report from writer");
-    sem_post(sem); /* signal data ready */
-    int st; waitpid(pid,&st,0);
-    munmap(s,sizeof(Shared)); close(fd); sem_close(sem);
-    shm_unlink(shname); sem_unlink(semname);
-    printf("Cleanup: shm exists? %s | semaphore removed.\n", shm_exists(shname)?"YES (leak!)":"no");
-    return 0;
+static void usage(void){
+ puts("CampusCompute commands:\n"
+ "  help\n  sched fcfs|rr|prio|all [file]\n"
+ "    file: id arrival burst priority, one job per line; max 32 jobs\n"
+ "  logger                 bounded queue -> campus.log (overwrites)\n"
+ "  ipc                    shared memory + named semaphore\n"
+ "  banker safe|unsafe\n  worker normal|fail     failures are SIMULATED\n"
+ "  rlimit                 child-only memory and CPU limits\n"
+ "  demo                   run all features\n"
+ "Build: make (or gcc -Wall -Wextra -O2 -pthread campus.c -o campus -lrt)\n"
+ "Clean generated executable/log: make clean");
 }
-
-/* ---------- FR5: Banker's safety algorithm ---------- */
-#define NP 5
-#define NR 3
-static int cmd_banker(const char *which) {
-    int avail[NR], alloc[NP][NR]={{0,1,0},{2,0,0},{3,0,2},{2,1,1},{0,0,2}};
-    int max[NP][NR]={{7,5,3},{3,2,2},{9,0,2},{2,2,2},{4,3,3}};
-    if(!strcmp(which,"safe")){ int a[NR]={3,3,2}; memcpy(avail,a,sizeof a);}
-    else if(!strcmp(which,"unsafe")){ int a[NR]={0,0,1}; memcpy(avail,a,sizeof a);
-        alloc[1][0]=2; alloc[1][1]=0; alloc[1][2]=0; max[1][0]=3; max[1][1]=2; max[1][2]=2; }
-    else { fprintf(stderr,"Error: use 'banker safe' or 'banker unsafe'\n"); return 1; }
-    int need[NP][NR];
-    printf("\n== Banker's algorithm (%s case) ==\nAvailable: %d %d %d\n",which,avail[0],avail[1],avail[2]);
-    printf("P    Alloc    Max      Need\n");
-    for(int i=0;i<NP;i++){ printf("P%d   ",i);
-        for(int r=0;r<NR;r++) printf("%d ",alloc[i][r]); printf("  ");
-        for(int r=0;r<NR;r++) printf("%d ",max[i][r]); printf("  ");
-        for(int r=0;r<NR;r++){ need[i][r]=max[i][r]-alloc[i][r]; printf("%d ",need[i][r]); } printf("\n"); }
-    int work[NR], fin[NP]={0}, seq[NP], cntf=0;
-    memcpy(work,avail,sizeof work);
-    int progress=1;
-    while(cntf<NP && progress){ progress=0;
-        for(int i=0;i<NP;i++){ if(fin[i]) continue;
-            int ok=1; for(int r=0;r<NR;r++) if(need[i][r]>work[r]){ok=0;break;}
-            if(ok){ for(int r=0;r<NR;r++) work[r]+=alloc[i][r]; fin[i]=1; seq[cntf++]=i; progress=1; } } }
-    if(cntf==NP){ printf("Result: SAFE. Safe sequence: "); for(int i=0;i<NP;i++) printf("P%d%s",seq[i],i<NP-1?" -> ":"\n"); }
-    else { printf("Result: UNSAFE. Processes that cannot finish:"); for(int i=0;i<NP;i++) if(!fin[i]) printf(" P%d",i); printf("\n"); }
-    return 0;
+static int demo(void){
+ int r[7];r[0]=sched("all",NULL);r[1]=logger();r[2]=ipc();
+ r[3]=banker("safe");r[4]=banker("unsafe");r[5]=worker("fail");r[6]=limits();
+ const char *names[]={"scheduling","logger","ipc","banker-safe","banker-unsafe","workers","rlimit"};
+ int rc=0;puts("\n===== DEMO SUMMARY =====");
+ for(int i=0;i<7;i++){printf("%-14s %s\n",names[i],r[i]?"FAIL":"OK");rc|=r[i];}return rc;
 }
-
-/* ---------- FR6: worker failure detection ---------- */
-static int cmd_worker(const char *mode) {
-    int fail = !strcmp(mode,"fail");
-    if(!fail && strcmp(mode,"normal")){ fprintf(stderr,"Error: use 'worker normal' or 'worker fail'\n"); return 1; }
-    pid_t pids[3];
-    for(int i=0;i<3;i++){
-        pids[i]=fork();
-        if(pids[i]<0){perror("fork");return 1;}
-        if(pids[i]==0){
-            printf("[worker %d pid=%d] started\n",i+1,getpid()); fflush(stdout);
-            usleep(50000);
-            if(fail && i==1){ printf("[worker 2] SIMULATED failure: exit(3)\n"); fflush(stdout); _exit(3); }
-            if(fail && i==2){ printf("[worker 3] SIMULATED crash: raising SIGKILL on itself\n"); fflush(stdout); raise(SIGKILL); }
-            _exit(0);
-        }
-    }
-    int bad=0;
-    for(int i=0;i<3;i++){
-        int st; pid_t p=waitpid(pids[i],&st,0);
-        if(p<0){perror("waitpid");continue;}
-        if(WIFEXITED(st)){ printf("[parent] pid %d exited with status %d -> %s\n",p,WEXITSTATUS(st),WEXITSTATUS(st)?"FAILED (simulated)":"OK"); if(WEXITSTATUS(st)) bad++; }
-        else if(WIFSIGNALED(st)){ printf("[parent] pid %d killed by signal %d (%s) -> FAILED (simulated)\n",p,WTERMSIG(st),strsignal(WTERMSIG(st))); bad++; }
-    }
-    printf("[parent] summary: %d of 3 workers failed. Remaining children: %s\n",bad,waitpid(-1,NULL,WNOHANG)<0&&errno==ECHILD?"none":"some");
-    return 0;
-}
-
-/* ---------- FR7: resource limits ---------- */
-static int cmd_rlimit(void) {
-    pid_t p=fork();
-    if(p<0){perror("fork");return 1;}
-    if(p==0){
-        struct rlimit rl={64UL<<20,64UL<<20};
-        if(setrlimit(RLIMIT_AS,&rl)<0){perror("setrlimit");_exit(2);}
-        printf("[child] RLIMIT_AS set to 64 MB; trying to allocate 256 MB...\n");
-        void *m=malloc(256UL<<20);
-        printf("[child] malloc(256MB) -> %s (%s)\n",m?"succeeded":"NULL",m?"limit not enforced":strerror(errno));
-        _exit(m?1:0);
-    }
-    int st; waitpid(p,&st,0);
-    printf("[parent] memory-limit child exit status %d (0 = limit observed)\n",WEXITSTATUS(st));
-    p=fork();
-    if(p==0){
-        struct rlimit rl={1,3}; setrlimit(RLIMIT_CPU,&rl);
-        printf("[child] RLIMIT_CPU set to 1 s; spinning...\n"); fflush(stdout);
-        for(;;);
-    }
-    waitpid(p,&st,0);
-    if(WIFSIGNALED(st)) printf("[parent] CPU-limit child terminated by signal %d (%s)\n",WTERMSIG(st),strsignal(WTERMSIG(st)));
-    return 0;
-}
-
-/* ---------- FR8 / integrated demo ---------- */
-static void usage(void) {
-    puts("CampusCompute commands:\n"
-         "  help                         show this message\n"
-         "  sched fcfs|rr|prio|all [file] CPU scheduling (file lines: id arrival burst priority)\n"
-         "  logger                       threaded producer-consumer logger -> campus.log\n"
-         "  ipc                          shared memory + named semaphore demo\n"
-         "  banker safe|unsafe           Banker's safety algorithm\n"
-         "  worker normal|fail           fork/waitpid worker demo (failure is SIMULATED)\n"
-         "  rlimit                       setrlimit demo (memory + CPU)\n"
-         "  demo                         run everything and print a summary");
-}
-static int cmd_demo(void) {
-    int rc=0; int r[6];
-    r[0]=cmd_sched("all",NULL); r[1]=cmd_logger(); r[2]=cmd_ipc();
-    r[3]=cmd_banker("safe"); r[4]=cmd_banker("unsafe"); r[5]=cmd_worker("fail");
-    fflush(stdout); int x=cmd_rlimit();
-    const char *nm[]={"scheduling","logger","ipc","banker-safe","banker-unsafe","workers"};
-    printf("\n===== DEMO SUMMARY =====\n");
-    for(int i=0;i<6;i++){ printf("%-14s %s\n",nm[i],r[i]?"FAIL":"OK"); rc|=r[i]; }
-    printf("%-14s %s\n","rlimit",x?"FAIL":"OK");
-    return rc|x;
-}
-
-int main(int argc, char **argv) {
-    setvbuf(stdout,NULL,_IOLBF,0);
-    if(argc<2){ usage(); return 1; }
-    const char *c=argv[1];
-    if(!strcmp(c,"help")){ usage(); return 0; }
-    if(!strcmp(c,"sched")){ if(argc<3){fprintf(stderr,"Error: sched needs an algorithm\n");usage();return 1;} return cmd_sched(argv[2],argc>3?argv[3]:NULL); }
-    if(!strcmp(c,"logger")) return cmd_logger();
-    if(!strcmp(c,"ipc")) return cmd_ipc();
-    if(!strcmp(c,"banker")){ if(argc<3){fprintf(stderr,"Error: banker needs safe|unsafe\n");return 1;} return cmd_banker(argv[2]); }
-    if(!strcmp(c,"worker")){ if(argc<3){fprintf(stderr,"Error: worker needs normal|fail\n");return 1;} return cmd_worker(argv[2]); }
-    if(!strcmp(c,"rlimit")) return cmd_rlimit();
-    if(!strcmp(c,"demo")) return cmd_demo();
-    fprintf(stderr,"Error: unknown command '%s'\n",c); usage(); return 1;
+int main(int argc,char **argv){
+ setvbuf(stdout,NULL,_IOLBF,0);
+ if(argc==2){
+  if(!strcmp(argv[1],"help")){usage();return 0;}
+  if(!strcmp(argv[1],"logger"))return logger();
+  if(!strcmp(argv[1],"ipc"))return ipc();
+  if(!strcmp(argv[1],"rlimit"))return limits();
+  if(!strcmp(argv[1],"demo"))return demo();
+ }
+ if(argc>=3 && argc<=4 && !strcmp(argv[1],"sched"))return sched(argv[2],argc==4?argv[3]:NULL);
+ if(argc==3 && !strcmp(argv[1],"banker"))return banker(argv[2]);
+ if(argc==3 && !strcmp(argv[1],"worker"))return worker(argv[2]);
+ fprintf(stderr,"Error: invalid command or arguments.\n");usage();return 1;
 }
